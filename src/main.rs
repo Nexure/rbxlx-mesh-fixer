@@ -50,7 +50,7 @@ macro_rules! modify_property {
     ($props:expr, $prop:expr, $value:expr) => {
         if let Some(mut_prop) = $props.get_mut($prop) {
             *mut_prop = $value;
-            // Variant::Content(rbx_types::Content::from(new_mesh.asset_id.clone()))
+        // Variant::Content(rbx_types::Content::from(new_mesh.asset_id.clone()))
         } else {
             panic!(&format!("Failed to modify property {:?} on mesh", $prop))
         }
@@ -113,6 +113,7 @@ fn main() {
     let children = get_workspace_children(&dom);
 
     let mut textures = BTreeMap::<i32, CachedMesh>::new();
+    let _ = std::fs::create_dir("cache");
 
     for child_ref in children {
         let child = dom.get_by_ref_mut(child_ref).expect("workspace-child");
@@ -162,7 +163,7 @@ fn main() {
                 Variant::Vector3(new_mesh.init_size)
             );
 
-            let rotation = mesh.calculate_rotation(&new_mesh.mesh);
+            /*let rotation = mesh.calculate_rotation(&new_mesh.mesh);
             modify_property!(
                 child.properties,
                 "CFrame",
@@ -174,7 +175,7 @@ fn main() {
                 "Converting {:?} to {:?}",
                 mesh_id,
                 new_mesh.asset_id.clone()
-            );
+            );*/
             println!("Id: {:?}", child.properties["MeshId"]);
         } else {
             textures.insert(
