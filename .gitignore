@@ -1,0 +1,7 @@
+/target
+cache/
+
+*.rbxl
+log.txt
+output.txt
+.DS_Store
