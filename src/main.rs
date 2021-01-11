@@ -1,20 +1,23 @@
 use core::panic;
+use futures::future::Future;
 use rbx_dom_weak::{
     types::{Ref, Variant},
     WeakDom,
 };
-use rbx_types::{CFrame, Vector3};
-
+use rbx_types::{CFrame, Matrix3, Vector3};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     error::Error,
     fs::File,
     io::{BufReader, BufWriter, Write},
     path::Path,
+    sync::Arc,
 };
 
 mod utils;
-use utils::{cframe::CFrameExt, mesh_reader::RobloxMesh};
+use utils::{
+    asset_downloader::download_asset, cframe::CFrameExt, mesh_reader::RobloxMesh, GenericError,
+};
 
 macro_rules! get_content {
     ($props:expr, $name:expr) => {
@@ -90,40 +93,94 @@ fn write_log(string: String) -> Result<(), Box<dyn Error + 'static>> {
     Ok(())
 }
 
-fn get_workspace_children(dom: &WeakDom) -> Vec<Ref> {
-    let data_model = dom.root();
-    let workspace = dom
-        .get_by_ref(
-            *data_model
-                .children()
-                .iter()
-                .find(|x| dom.get_by_ref(*x.to_owned()).unwrap().name == "Workspace")
-                .expect("workspace"),
-        )
-        .unwrap();
-
-    workspace.children().into_iter().cloned().collect()
+fn get_children_recursive(children: &mut Vec<Ref>, dom: &WeakDom, referent: Ref) {
+    let ref_inst = dom.get_by_ref(referent).expect("ref-inst");
+    let ref_children = ref_inst.children();
+    for child in ref_children {
+        children.push(child.clone());
+        get_children_recursive(children, dom, child.clone());
+    }
 }
 
-fn main() {
-    let input_path = std::env::args().nth(1).expect("input-path");
-    let output_path = std::env::args().nth(2).expect("output-path");
+fn filter_mesh_parts(dom: &WeakDom, refs: Vec<Ref>) -> Vec<Ref> {
+    let mut mesh_parts = Vec::<Ref>::new();
 
-    let mut dom = open_rbx_place(input_path).expect("could not open place");
-    let children = get_workspace_children(&dom);
-
-    let mut textures = BTreeMap::<i32, CachedMesh>::new();
-
-    for child_ref in children {
-        let child = dom.get_by_ref_mut(child_ref).expect("workspace-child");
+    for referent in refs {
+        let child = dom.get_by_ref(referent).expect("referent");
         if !child.properties.contains_key("TextureID") || !child.properties.contains_key("MeshId") {
-            println!(
-                "Warning: skipping child {:?} (not a MeshPart)",
-                child.name.clone()
-            );
             continue;
         }
 
+        mesh_parts.push(referent);
+    }
+
+    mesh_parts
+}
+
+fn get_workspace_children(dom: &WeakDom) -> Vec<Ref> {
+    let data_model = dom.root();
+    let mut children = Vec::<Ref>::new();
+    let workspace = *data_model
+        .children()
+        .iter()
+        .find(|x| dom.get_by_ref(*x.to_owned()).unwrap().name == "Workspace")
+        .expect("workspace");
+
+    get_children_recursive(&mut children, dom, workspace);
+    filter_mesh_parts(dom, children)
+}
+
+async fn download_meshs(dom: &WeakDom, refs: Vec<Ref>) -> Result<(), ()> {
+    let mut handles = vec![];
+    let master_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+
+    for referent in refs {
+        if let Some(child) = dom.get_by_ref(referent) {
+            let mesh_id = get_content!(child.properties, "MeshId").clone();
+            let semaphore = master_semaphore.clone();
+            handles.push(tokio::spawn(async move {
+                match semaphore.acquire().await {
+                    Ok(_) => download_asset(mesh_id).await.is_ok(),
+                    Err(_) => false,
+                }
+            }));
+        } else {
+            return Err(());
+        }
+    }
+
+    let futures = futures::future::join_all(handles).await;
+    if let Some(_) = futures.iter().find(|x| match x {
+        Ok(item) => !item.clone(),
+        Err(_) => true,
+    }) {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let input_path = std::env::args().nth(1).expect("input-path");
+    let output_path = std::env::args().nth(2).expect("output-path");
+
+    println!("Opening place..");
+    let mut dom = open_rbx_place(input_path).expect("could not open place");
+    println!("Getting children...");
+    let children = get_workspace_children(&dom);
+    println!("Found {:?} meshes", children.len());
+
+    print!("Downloading meshes... ");
+    if let Err(_) = download_meshs(&dom, children.clone()).await {
+        eprintln!("Error downloading one or more assets");
+        return;
+    }
+    println!("Done!");
+
+    let mut textures = BTreeMap::<i32, CachedMesh>::new();
+    for child_ref in children {
+        let child = dom.get_by_ref_mut(child_ref).expect("workspace-child");
         let texture_id = get_content!(child.properties, "TextureID");
         let mesh_id = get_content!(child.properties, "MeshId");
         let init_size = get_size!(child.properties, "InitialSize");
@@ -138,7 +195,10 @@ fn main() {
             continue;
         }
 
-        let mesh = RobloxMesh::from_asset_id(mesh_id.clone()).expect("download-mesh");
+        let mesh = RobloxMesh::from_asset_id(mesh_id.clone())
+            .await
+            .expect("download-mesh");
+
         println!(
             "num_meshes={:?}, num_verts={:?}, num_faces={:?}, num_lod={:?}, num_bones={:?}, nts={:?}, nsd={:?}, stub={:?}, triangles={:?}, hash={:?}",
             mesh.header.num_meshes, mesh.header.num_verts, mesh.header.num_faces, mesh.header.num_lods, mesh.header.num_bones, mesh.header.name_table_size, mesh.header.num_skin_data, mesh.header.stub,

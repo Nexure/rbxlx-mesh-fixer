@@ -5,6 +5,7 @@ use std::{
 };
 
 use regex::Regex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::GenericError;
 
@@ -14,7 +15,7 @@ pub fn extract_assetid(asset_id: String) -> Result<String, GenericError> {
     Ok(result.as_str().to_string())
 }
 
-pub fn download_asset(asset_id: String) -> Result<Cursor<Vec<u8>>, GenericError> {
+pub async fn download_asset(asset_id: String) -> Result<Cursor<Vec<u8>>, GenericError> {
     let extracted_asset_id = extract_assetid(asset_id)?;
     let asset_path = format!("cache/{}", extracted_asset_id);
     let asset_url = format!(
@@ -24,15 +25,22 @@ pub fn download_asset(asset_id: String) -> Result<Cursor<Vec<u8>>, GenericError>
 
     let path = Path::new(&asset_path);
     if !metadata(path).is_ok() {
-        let mut response = reqwest::blocking::get(&asset_url)?;
+        let mut response = reqwest::get(&asset_url).await?;
         assert!(response.status().is_success());
 
-        let mut file = File::create(path).expect("Unable to cache file");
-        io::copy(&mut response, &mut file)?;
+        let mut file = tokio::fs::File::create(path)
+            .await
+            .expect("Unable to cache file");
+
+        while let Some(chunk) = response.chunk().await? {
+            file.write(&chunk).await?;
+        }
+
+        file.flush().await?;
     }
 
-    let mut file = File::open(path)?;
+    let mut file = tokio::fs::File::open(path).await?;
     let mut buffer = Vec::<u8>::new();
-    file.read_to_end(&mut buffer)?;
+    file.read_to_end(&mut buffer).await?;
     Ok(Cursor::new(buffer))
 }
